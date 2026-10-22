@@ -1,0 +1,11 @@
+# Optional extras for tools/guard.py. The listener works without them (heuristics only).
+#
+# Layer c) LLM judge: set ANTHROPIC_API_KEY and GUARD_LLM=1 (or GUARD_LLM=suspicious)
+anthropic>=0.120
+#
+# Layer b) local classifier: set GUARD_MODEL, e.g.
+#   GUARD_MODEL=protectai/deberta-v3-base-prompt-injection-v2   (Apache-2.0, open, English only)
+#   GUARD_MODEL=meta-llama/Llama-Prompt-Guard-2-86M              (gated, Llama 4 license, multilingual; needs `huggingface-cli login`)
+# CPU-only torch is enough: pip install torch --index-url https://download.pytorch.org/whl/cpu
+transformers>=4.44
+torch>=2.2

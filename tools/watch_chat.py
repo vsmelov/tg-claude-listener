@@ -29,7 +29,13 @@
     READY chat resolved: Alice (id 123456789)
     LISTENING 2 chat(s), пачки после 180 с тишины
     BATCH 2 новых сообщений в «Alice» (ids 8709450–8709451), обработать вместе
-    NEW {"chat_id": 123456789, "chat": "Alice", "id": 8709450, "from": "...", "date": "...", "text": "...", "media": null, "file": null}
+    BATCH 1 новых сообщений в «Alice» (ids 8709452–8709452), обработать вместе ⚠ injection risk: high (ids 8709452)
+    NEW {"chat_id": 123456789, "chat": "Alice", "id": 8709450, "from": "...", "date": "...", "text": "...", "media": null, "file": null, "guard": {...}}
+
+ЗАЩИТА ОТ PROMPT INJECTION. Каждое сообщение проходит tools/guard.py (эвристики EN+RU всегда; опционально
+локальный классификатор GUARD_MODEL и LLM-судья GUARD_LLM=1) — результат в поле "guard" записи, а если в пачке
+есть medium/high, к строке BATCH дописывается «⚠ injection risk: …». Сбой охраны слушатель не роняет: запись
+получает guard с ошибкой слоя. Подробности — docs/prompt-injection.md.
 
 Пример (Git Bash, из папки проекта, где лежит state):
     python tools/watch_chat.py \
@@ -53,10 +59,23 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
-from telethon import TelegramClient, events
+try:
+    from dotenv import load_dotenv
+except ImportError:  # tests import this module without the runtime deps
+    def load_dotenv(*_a, **_k):
+        return False
+try:
+    from telethon import TelegramClient, events
+except ImportError:  # only the pure helpers below are usable then
+    TelegramClient = events = None
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import guard  # noqa: E402 — tools/guard.py, prompt-injection screening
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:  # stdout replaced (tests)
+    pass
 # Telethon при обрыве сети пишет WARNING на каждую попытку («Server closed the connection», «Attempt N at
 # connecting failed») — под Monitor каждая строка становится уведомлением. Обрыв и восстановление и так
 # печатает сторож ниже (по одной строке), поэтому от Telethon оставляем только ERROR и выше.
@@ -78,6 +97,68 @@ load_dotenv(ROOT / ".env")
 # (догон, болтливый чат) Monitor глушит слушателя за флуд — 25.09.2026 так снесло оба дежурства.
 # Приходит только BATCH (сколько сообщений и в каком чате), тексты читаются из --log и из дампа tg-archive.
 FILTER = r"^(BATCH|READY|LISTENING|Traceback|RuntimeError|ConnectionError|AuthKey|.*Error)"
+# сколько секунд ждать опциональные слои охраны (ML/LLM) на пачку; дальше — только эвристики
+GUARD_BUDGET_SEC = float(os.getenv("GUARD_BUDGET_SEC", "15"))
+
+
+# ---------- запись сообщения и охрана (чистые функции, тестируются без Telegram) ----------
+
+def is_owner_call(m, trigger: str) -> bool:
+    """Исходящее сообщение владельца, текст/подпись которого начинается с триггера (/ai)."""
+    if not getattr(m, "out", False) or not trigger:
+        return False
+    return (getattr(m, "message", None) or "").lstrip().lower().startswith(trigger.lower())
+
+
+def message_file_name(m):
+    return getattr(getattr(m, "file", None), "name", None)
+
+
+def guard_message(m, trigger: str, optional: bool = True) -> dict:
+    """guard.assess для сообщения Telethon (или похожего объекта). Исключений не бросает."""
+    try:
+        return guard.safe_assess(getattr(m, "message", None) or "", sender_is_owner=is_owner_call(m, trigger),
+                                 media=(type(m.media).__name__ if getattr(m, "media", None) else None),
+                                 file_name=message_file_name(m), optional=optional)
+    except Exception as e:  # noqa: BLE001 — охрана не должна ронять дежурство
+        return {"v": 0, "risk": "low", "trusted": False, "reasons": [],
+                "layers": {"guard": {"status": "error", "error": f"{type(e).__name__}: {e}"[:200]}}}
+
+
+def build_record(chat_id: int, title: str, m, trigger: str, guard_result: dict | None = None) -> dict:
+    """JSON-запись для --log / строки NEW. guard_result — заранее посчитанный guard (иначе считается тут)."""
+    s = getattr(m, "sender", None)
+    sender = (getattr(s, "title", None) or " ".join(
+        x for x in (getattr(s, "first_name", None), getattr(s, "last_name", None)) if x) or None) if s else None
+    rec = {"chat_id": chat_id, "chat": title, "id": m.id, "from": sender,
+           "date": m.date.astimezone().strftime("%Y-%m-%d %H:%M"),
+           "text": (getattr(m, "message", None) or "")[:2000],
+           "media": (type(m.media).__name__ if getattr(m, "media", None) else None),
+           "file": message_file_name(m)}
+    if is_owner_call(m, trigger):
+        # владелец аккаунта позвал Claude в чате: текст после триггера — его задание, ответ — в этот же чат
+        rec["owner_call"] = True
+        rec["from"] = f"владелец аккаунта ({trigger})"
+    rec["guard"] = guard_result if guard_result is not None else guard_message(m, trigger)
+    return rec
+
+
+def guard_suffix(records: list[dict]) -> str:
+    """Хвост строки BATCH: « ⚠ injection risk: high (ids 5, 7)», если среди НЕ-владельческих сообщений есть
+    medium/high; иначе пусто. Сбой слоя охраны тоже отмечается, чтобы его было видно."""
+    rank = {"low": 0, "medium": 1, "high": 2}
+    flagged = [r for r in records if not r.get("owner_call")
+               and rank.get((r.get("guard") or {}).get("risk"), 0) >= 1]
+    errors = [r["id"] for r in records if any(
+        isinstance(v, dict) and v.get("status") == "error"
+        for v in ((r.get("guard") or {}).get("layers") or {}).values())]
+    out = ""
+    if flagged:
+        top = max((r["guard"]["risk"] for r in flagged), key=rank.__getitem__)
+        out += f" ⚠ injection risk: {top} (ids {', '.join(str(r['id']) for r in flagged)})"
+    if errors:
+        out += f" (guard layer error: ids {', '.join(map(str, errors))})"
+    return out
 
 
 # ---------- сессия и прокси (как в server.py, без импорта сервера) ----------
@@ -197,6 +278,7 @@ class Watcher:
         self.entities: list = []
         self.ids: list[int] = []
         self.catch_lock = asyncio.Lock()
+        self.inflight: dict[int, set] = {}  # ids, которые сейчас проходят охрану в flush()
 
     async def resolve(self, client, spec: str):
         spec = spec.strip()
@@ -225,9 +307,7 @@ class Watcher:
         """Исходящее сообщение владельца аккаунта, текст/подпись которого начинается с триггера (/ai) —
         так владелец аккаунта сам зовёт Claude прямо в чате (04.10.2026). Ответы Claude начинаются с «🤖 Claude:»,
         поэтому сами себя не вызывают."""
-        if not m.out or not self.a.trigger:
-            return False
-        return (m.message or "").lstrip().lower().startswith(self.a.trigger.lower())
+        return is_owner_call(m, self.a.trigger)
 
     async def wanted(self, m) -> bool:
         if m.out:
@@ -352,7 +432,7 @@ class Watcher:
                 continue
             missed = [m for m in missed if not self.seen(chat_id, m.id)]  # событие могло успеть раньше
             if missed:
-                self.flush(chat_id, missed, catchup=True, reason=reason)
+                await self.flush(chat_id, missed, catchup=True, reason=reason)
                 if reason != "старта":  # на старте реакция на старое не нужна
                     for m in missed:
                         asyncio.create_task(self.ack(m))
@@ -361,6 +441,8 @@ class Watcher:
         """Сообщение уже выдано (id ≤ last_seen_id) или лежит в копящейся пачке — чтобы событие и сверка
         не выдали одно и то же дважды."""
         if msg_id <= int(self.state.chat(chat_id).get("last_seen_id", 0)):
+            return True
+        if msg_id in self.inflight.get(chat_id, ()):
             return True
         return any(p.id == msg_id for p in self.pending.get(chat_id, []))
 
@@ -405,37 +487,53 @@ class Watcher:
             await asyncio.sleep(self.a.quiet)
         except asyncio.CancelledError:
             return
+        if self.timers.get(chat_id) is asyncio.current_task():
+            self.timers.pop(chat_id, None)  # новое сообщение больше не отменит эту выдачу
         batch = self.pending.pop(chat_id, [])
         if batch:
-            self.flush(chat_id, batch)
+            await asyncio.shield(self.flush(chat_id, batch))
 
-    def flush(self, chat_id: int, batch: list, catchup: bool = False, reason: str = "старта"):
+    async def guard_batch(self, batch: list) -> list[dict]:
+        """guard для каждого сообщения пачки в потоках (LLM/ML не блокируют цикл событий). Не уложились в
+        GUARD_BUDGET_SEC — только эвристики. Исключения сюда не доходят: guard_message их глотает."""
+        trig = self.a.trigger
+        try:
+            return list(await asyncio.wait_for(
+                asyncio.gather(*(asyncio.to_thread(guard_message, m, trig) for m in batch)), GUARD_BUDGET_SEC))
+        except Exception as e:  # noqa: BLE001 — таймаут или что угодно: деградируем до эвристик
+            out = []
+            for m in batch:
+                g = guard_message(m, trig, optional=False)
+                g.setdefault("layers", {})["optional"] = {
+                    "status": "error", "error": f"{type(e).__name__} (budget {GUARD_BUDGET_SEC:g}s)"}
+                out.append(g)
+            return out
+
+    async def flush(self, chat_id: int, batch: list, catchup: bool = False, reason: str = "старта"):
         ids = [m.id for m in batch]
         title = self.titles.get(chat_id, str(chat_id))
-        calls = sum(1 for m in batch if self.owner_call(m))
+        self.inflight.setdefault(chat_id, set()).update(ids)
+        try:
+            guards = await self.guard_batch(batch)
+        except Exception as e:  # noqa: BLE001 — запись всё равно должна уйти
+            print(f"GuardError: {type(e).__name__}: {str(e)[:120]}", flush=True)
+            guards = [{"v": 0, "risk": "low", "reasons": [],
+                       "layers": {"guard": {"status": "error", "error": type(e).__name__}}} for _ in batch]
+        records = [build_record(chat_id, title, m, self.a.trigger, g) for m, g in zip(batch, guards)]
+        calls = sum(1 for r in records if r.get("owner_call"))
         print(f"BATCH {len(batch)} новых сообщений в «{title}» (ids {min(ids)}–{max(ids)})"
               f"{f', из них {calls} — вызов владельца {self.a.trigger}' if calls else ''}"
-              f"{f' — догон после {reason}' if catchup else ''}, обработать вместе", flush=True)
-        for m in batch:
-            self.emit(chat_id, title, m)
+              f"{f' — догон после {reason}' if catchup else ''}, обработать вместе{guard_suffix(records)}",
+              flush=True)
+        for rec in records:
+            self.emit(rec)
+        self.inflight.get(chat_id, set()).difference_update(ids)
         st = self.state.chat(chat_id)
         st["last_seen_id"] = max(int(st.get("last_seen_id", 0)), max(ids))
         st["last_emit_at"] = datetime.now().isoformat(timespec="seconds")
         self.state.save()
 
-    def emit(self, chat_id: int, title: str, m):
-        s = m.sender
-        sender = (getattr(s, "title", None) or " ".join(
-            x for x in (getattr(s, "first_name", None), getattr(s, "last_name", None)) if x) or None) if s else None
-        rec = {"chat_id": chat_id, "chat": title, "id": m.id, "from": sender,
-               "date": m.date.astimezone().strftime("%Y-%m-%d %H:%M"),
-               "text": (m.message or "")[:2000],
-               "media": (type(m.media).__name__ if m.media else None),
-               "file": getattr(getattr(m, "file", None), "name", None)}
-        if self.owner_call(m):
-            # владелец аккаунта позвал Claude в чате: текст после триггера — его задание, ответ — в этот же чат
-            rec["owner_call"] = True
-            rec["from"] = f"владелец аккаунта ({self.a.trigger})"
+    def emit(self, rec: dict):
         line = "NEW " + json.dumps(rec, ensure_ascii=False)
         print(line, flush=True)
         if self.log:
